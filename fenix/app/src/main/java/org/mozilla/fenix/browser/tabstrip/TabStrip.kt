@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -22,7 +23,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyListItemInfo
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.systemGestureExclusion
@@ -32,19 +33,20 @@ import androidx.compose.material.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.dimensionResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Devices
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.tooling.preview.PreviewParameter
 import androidx.compose.ui.tooling.preview.PreviewParameterProvider
 import androidx.compose.ui.unit.coerceIn
 import androidx.compose.ui.unit.dp
+import androidx.core.text.BidiFormatter
 import mozilla.components.browser.state.action.TabListAction
 import mozilla.components.browser.state.state.createTab
 import mozilla.components.browser.state.store.BrowserStore
@@ -54,6 +56,10 @@ import org.mozilla.fenix.R
 import org.mozilla.fenix.components.AppStore
 import org.mozilla.fenix.components.components
 import org.mozilla.fenix.compose.Favicon
+import org.mozilla.fenix.compose.HorizontalFadingEdgeBox
+import org.mozilla.fenix.tabstray.browser.compose.DragItemContainer
+import org.mozilla.fenix.tabstray.browser.compose.createListReorderState
+import org.mozilla.fenix.tabstray.browser.compose.detectListPressAndDrag
 import org.mozilla.fenix.theme.FirefoxTheme
 import org.mozilla.fenix.theme.Theme
 
@@ -63,6 +69,7 @@ private val tabStripIconSize = 24.dp
 private val spaceBetweenTabs = 4.dp
 private val tabStripStartPadding = 8.dp
 private val addTabIconSize = 20.dp
+private val titleFadeWidth = 16.dp
 
 /**
  * Top level composable for the tabs strip.
@@ -72,6 +79,7 @@ private val addTabIconSize = 20.dp
  * @param appStore The [AppStore] instance used to observe browsing mode.
  * @param tabsUseCases The [TabsUseCases] instance to perform tab actions.
  * @param onAddTabClick Invoked when the add tab button is clicked.
+ * @param onCloseTabClick Invoked when a tab is closed.
  * @param onLastTabClose Invoked when the last remaining open tab is closed.
  * @param onSelectedTabClick Invoked when a tab is selected.
  */
@@ -82,7 +90,8 @@ fun TabStrip(
     appStore: AppStore = components.appStore,
     tabsUseCases: TabsUseCases = components.useCases.tabsUseCases,
     onAddTabClick: () -> Unit,
-    onLastTabClose: () -> Unit,
+    onCloseTabClick: (isPrivate: Boolean) -> Unit,
+    onLastTabClose: (isPrivate: Boolean) -> Unit,
     onSelectedTabClick: () -> Unit,
 ) {
     val isPrivateMode by appStore.observeAsState(false) { it.mode.isPrivate }
@@ -93,15 +102,21 @@ fun TabStrip(
     TabStripContent(
         state = state,
         onAddTabClick = onAddTabClick,
-        onCloseTabClick = {
+        onCloseTabClick = { id, isPrivate ->
             if (state.tabs.size == 1) {
-                onLastTabClose()
+                onLastTabClose(isPrivate)
             }
-            tabsUseCases.removeTab(it)
+            tabsUseCases.removeTab(id)
+            onCloseTabClick(isPrivate)
         },
         onSelectedTabClick = {
             tabsUseCases.selectTab(it)
             onSelectedTabClick()
+        },
+        onMove = { tabId, targetId, placeAfter ->
+            if (tabId != targetId) {
+                tabsUseCases.moveTabs(listOf(tabId), targetId, placeAfter)
+            }
         },
     )
 }
@@ -110,8 +125,9 @@ fun TabStrip(
 private fun TabStripContent(
     state: TabStripState,
     onAddTabClick: () -> Unit,
-    onCloseTabClick: (id: String) -> Unit,
+    onCloseTabClick: (id: String, isPrivate: Boolean) -> Unit,
     onSelectedTabClick: (id: String) -> Unit,
+    onMove: (tabId: String, targetId: String, placeAfter: Boolean) -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -125,6 +141,7 @@ private fun TabStripContent(
             modifier = Modifier.weight(1f, fill = false),
             onCloseTabClick = onCloseTabClick,
             onSelectedTabClick = onSelectedTabClick,
+            onMove = onMove,
         )
 
         IconButton(onClick = onAddTabClick) {
@@ -143,8 +160,9 @@ private fun TabStripContent(
 private fun TabsList(
     state: TabStripState,
     modifier: Modifier = Modifier,
-    onCloseTabClick: (id: String) -> Unit,
+    onCloseTabClick: (id: String, isPrivate: Boolean) -> Unit,
     onSelectedTabClick: (id: String) -> Unit,
+    onMove: (tabId: String, targetId: String, placeAfter: Boolean) -> Unit,
 ) {
     BoxWithConstraints(modifier = modifier) {
         val listState = rememberLazyListState()
@@ -153,29 +171,51 @@ private fun TabsList(
         val availableWidth = maxWidth - tabStripStartPadding
         val tabWidth = (availableWidth / state.tabs.size) - spaceBetweenTabs
 
+        val reorderState = createListReorderState(
+            listState = listState,
+            onMove = { movedTab, adjacentTab ->
+                onMove(
+                    (movedTab.key as String),
+                    (adjacentTab.key as String),
+                    movedTab.index < adjacentTab.index,
+                )
+            },
+            ignoredItems = emptyList(),
+        )
+
         LazyRow(
-            modifier = Modifier,
+            modifier = Modifier.detectListPressAndDrag(
+                reorderState = reorderState,
+                listState = listState,
+                shouldLongPressToDrag = true,
+            ),
             state = listState,
             contentPadding = PaddingValues(start = tabStripStartPadding),
         ) {
-            items(
+            itemsIndexed(
                 items = state.tabs,
-                key = { it.id },
-            ) { itemState ->
-                TabItem(
-                    state = itemState,
-                    onCloseTabClick = onCloseTabClick,
-                    onSelectedTabClick = onSelectedTabClick,
-                    modifier = Modifier
-                        .padding(end = spaceBetweenTabs)
-                        .animateItemPlacement()
-                        .width(
-                            tabWidth.coerceIn(
-                                minimumValue = minTabStripItemWidth,
-                                maximumValue = maxTabStripItemWidth,
+                key = { _, item -> item.id },
+            ) { index, itemState ->
+                DragItemContainer(
+                    state = reorderState,
+                    key = itemState.id,
+                    position = index,
+                ) {
+                    TabItem(
+                        state = itemState,
+                        onCloseTabClick = onCloseTabClick,
+                        onSelectedTabClick = onSelectedTabClick,
+                        modifier = Modifier
+                            .padding(end = spaceBetweenTabs)
+                            .animateItemPlacement()
+                            .width(
+                                tabWidth.coerceIn(
+                                    minimumValue = minTabStripItemWidth,
+                                    maximumValue = maxTabStripItemWidth,
+                                ),
                             ),
-                        ),
-                )
+                    )
+                }
             }
         }
 
@@ -213,25 +253,26 @@ private fun LazyListState.isItemPartiallyVisible(itemInfo: LazyListItemInfo?) =
 private fun TabItem(
     state: TabStripItem,
     modifier: Modifier = Modifier,
-    onCloseTabClick: (id: String) -> Unit,
+    onCloseTabClick: (id: String, isPrivate: Boolean) -> Unit,
     onSelectedTabClick: (id: String) -> Unit,
 ) {
+    val backgroundColor = if (state.isPrivate) {
+        if (state.isSelected) {
+            FirefoxTheme.colors.layer3
+        } else {
+            FirefoxTheme.colors.layer2
+        }
+    } else {
+        if (state.isSelected) {
+            FirefoxTheme.colors.layer2
+        } else {
+            FirefoxTheme.colors.layer3
+        }
+    }
+
     TabStripCard(
         modifier = modifier.fillMaxSize(),
-        backgroundColor =
-        if (state.isPrivate) {
-            if (state.isSelected) {
-                FirefoxTheme.colors.layer3
-            } else {
-                FirefoxTheme.colors.layer2
-            }
-        } else {
-            if (state.isSelected) {
-                FirefoxTheme.colors.layer2
-            } else {
-                FirefoxTheme.colors.layer3
-            }
-        },
+        backgroundColor = backgroundColor,
         elevation = if (state.isSelected) {
             selectedTabStripCardElevation
         } else {
@@ -246,25 +287,40 @@ private fun TabItem(
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Row(
-                modifier = Modifier.weight(1f, fill = false),
+                modifier = Modifier.weight(1f),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                // This makes sure that isRtl is only calculated when the title changes.
+                val isTitleRtl = remember(state.title) {
+                    BidiFormatter.getInstance().isRtl(state.title)
+                }
+
                 Spacer(modifier = Modifier.size(8.dp))
 
                 TabStripIcon(state.url)
 
                 Spacer(modifier = Modifier.size(8.dp))
 
-                Text(
-                    text = state.title,
-                    color = FirefoxTheme.colors.textPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    style = FirefoxTheme.typography.subtitle2,
-                )
+                HorizontalFadingEdgeBox(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight(),
+                    fadeWidth = titleFadeWidth,
+                    backgroundColor = backgroundColor,
+                    isContentRtl = isTitleRtl,
+                ) {
+                    Text(
+                        text = state.title,
+                        modifier = Modifier.align(Alignment.CenterStart),
+                        color = FirefoxTheme.colors.textPrimary,
+                        softWrap = false,
+                        maxLines = 1,
+                        style = FirefoxTheme.typography.subtitle2,
+                    )
+                }
             }
 
-            IconButton(onClick = { onCloseTabClick(state.id) }) {
+            IconButton(onClick = { onCloseTabClick(state.id, state.isPrivate) }) {
                 Icon(
                     painter = painterResource(R.drawable.mozac_ic_cross_20),
                     tint = FirefoxTheme.colors.iconPrimary,
@@ -378,8 +434,9 @@ private fun TabStripContentPreview(tabs: List<TabStripItem>) {
                 tabs = tabs,
             ),
             onAddTabClick = {},
-            onCloseTabClick = {},
+            onCloseTabClick = { _, _ -> },
             onSelectedTabClick = {},
+            onMove = { _, _, _ -> },
         )
     }
 }
@@ -407,6 +464,7 @@ private fun TabStripPreview() {
                     browserStore.dispatch(TabListAction.AddTabAction(tab))
                 },
                 onLastTabClose = {},
+                onCloseTabClick = {},
                 onSelectedTabClick = {},
             )
         }

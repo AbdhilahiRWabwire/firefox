@@ -621,6 +621,7 @@ dependencies {
     implementation project(':lib-push-firebase')
     implementation project(':lib-state')
     implementation project(':lib-dataprotect')
+    testImplementation project(':support-test-fakes')
 
     debugImplementation ComponentsDependencies.leakcanary
     debugImplementation ComponentsDependencies.androidx_compose_ui_tooling
@@ -726,6 +727,7 @@ dependencies {
     testImplementation "org.mozilla.telemetry:glean-native-forUnitTests:${project.ext.glean_version}"
 
     lintChecks project(":mozilla-lint-rules")
+    lintChecks project(':tooling-lint')
 }
 
 protobuf {
